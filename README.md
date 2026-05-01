@@ -2,6 +2,12 @@
 
 Two PostgreSQL databases with the same 6 million rows. One has no custom indexes (`hospital_slow`), the other is the one where you add them (`hospital_fast`). A small Flask dashboard runs the same queries against both at once so you can actually see what indexes do.
 
+The project is delivered in parts:
+
+- **Part 1 - Indexes** (you are here). Build 10+ indexes from the audit report, prove each one in the Performance Lab.
+- **Part 2 - Concurrency.** Reproduce the 5 classic concurrency bugs (Lost Update, Non-Repeatable Read, Phantom Read, Dirty Read attempt, Deadlock) by inventing your own hospital scenarios in the Transaction Lab, then fix each one.
+- **Part 3 - Backup & Recovery** (later).
+
 ## Files
 
 | File | What it is |
@@ -9,9 +15,9 @@ Two PostgreSQL databases with the same 6 million rows. One has no custom indexes
 | `00-student-guide.md` | Walkthrough of every tab in the dashboard. Read after setup. |
 | `01a-schema-hospital-slow.sql` | Creates `hospital_slow` and its 9 tables. |
 | `02-data-generation.sql` | Inserts ~6M rows. |
-| `03-student-tasks.md` | What you actually have to do. |
-| `05-business-case.md` | The IT audit report. 15 performance problems are hidden in it. |
-| `PROJECT-BRIEF.md` | Overview of the full project. |
+| `03-student-tasks.md` | Part 1 task sheet (Indexes). |
+| `05-business-case.md` | The IT audit report for Part 1. 15 performance problems are hidden in it. |
+| `06-concurrency-tasks.md` | Part 2 task sheet (Concurrency). |
 | `dashboard/app.py` | The Flask app. |
 
 ## What you need before you start

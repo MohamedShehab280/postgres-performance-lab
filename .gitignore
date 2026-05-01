@@ -22,3 +22,10 @@ hospital_*_backup.sql
 # Env / secrets
 .env
 .env.local
+
+# Local notes / drafts
+*-solutions.md
+*-solution.md
+*-notes.md
+_*.md
+session_summary*.md

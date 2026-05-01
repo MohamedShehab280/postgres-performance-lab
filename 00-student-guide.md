@@ -16,14 +16,11 @@ You are going to build two identical hospital databases. Same tables, same data,
 
 The dashboard app connects to both at the same time and runs your queries against both. You see the difference in real numbers, not theory.
 
-This is Part 1 of the project and it is only about indexes. You will:
+The project is delivered in parts:
 
-- Read the IT audit report in `05-business-case.md` and find the performance problems hidden in the staff quotes.
-- Build indexes in the Index Lab, each one justified with a quote from that report.
-- Confirm each index actually helps in the Performance Lab.
-- Verify everything in the Index Inspector.
-
-Parts 2-4 (Concurrency, Deadlocks, Backup & Recovery) will come later and will reuse the same dashboard. Ignore the tabs related to those for now.
+- **Part 1 - Indexes** (`03-student-tasks.md`). Read the IT audit report in `05-business-case.md`, find the performance problems hidden in the staff quotes, build indexes in the Index Lab, confirm each one in the Performance Lab, verify in the Index Inspector.
+- **Part 2 - Concurrency** (`06-concurrency-tasks.md`). Reproduce the 5 classic concurrency bugs (Lost Update, Non-Repeatable Read, Phantom Read, Dirty Read attempt, Deadlock) in the Transaction Lab by inventing your own hospital scenarios, then fix each one.
+- **Part 3 - Backup & Recovery.** Comes later.
 
 ---
 
@@ -37,7 +34,7 @@ Running the data generator twice would give you *similar* but not *identical* ro
 2. Tell PostgreSQL to clone the whole database: `CREATE DATABASE hospital_fast TEMPLATE hospital_slow;`. This copies it byte-for-byte in a few seconds.
 3. Add your indexes only on `hospital_fast`.
 
-One line of SQL, no terminal, no backup files. The `pg_dump` / `psql restore` workflow is covered later in Part 4 (Backup & Recovery), where it's the actual topic.
+One line of SQL, no terminal, no backup files. The `pg_dump` / `psql restore` workflow is covered later in Part 3 (Backup & Recovery), where it's the actual topic.
 
 ---
 
@@ -258,6 +255,29 @@ SELECT indexname FROM pg_indexes WHERE schemaname='public' AND indexname NOT LIK
 ```
 
 **If hospital_fast shows fewer indexes than you expected:** Go back to the Index Lab and re-create the missing ones.
+
+---
+
+### Tab 5: Transaction Lab (Part 2)
+
+Where you do the Part 2 work. Five fixed slots, one per concurrency problem - Lost Update, Non-Repeatable Read, Phantom Read, Dirty Read attempt, Deadlock.
+
+For each slot you fill in 8 fields:
+
+1. Your hospital scenario (invent your own, do not reuse the slide example).
+2. Session A buggy SQL.
+3. Session B buggy SQL.
+4. What went wrong (the bad outcome you saw).
+5. Session A fixed SQL.
+6. Session B fixed SQL.
+7. Why the bug happened.
+8. Why the fix works.
+
+Each slot has **Copy Session A SQL** and **Copy Session B SQL** buttons that put the script on your clipboard. Paste each into its own pgAdmin Query Tool tab and run them step by step in the right order.
+
+A slot's status badge moves from `Not started` to `In progress` to `Complete` as you fill it. The progress bar at the top shows `x / 5`. Everything is saved in your browser.
+
+Full task description is in `06-concurrency-tasks.md`.
 
 ---
 

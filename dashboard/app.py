@@ -193,213 +193,6 @@ def api_compare(qid):
     })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  API: CONCURRENT BOOKING SIMULATION
-# ─────────────────────────────────────────────────────────────────────────────
-@app.route("/api/concurrent-book", methods=["POST"])
-def api_concurrent_book():
-    """
-    Fires two simultaneous booking attempts for the same doctor + time slot.
-    One should succeed, one should fail (or both succeed if no protection).
-    Returns both results including PostgreSQL error messages.
-    """
-    data = request.get_json() or {}
-    db_key = data.get("db", "slow")
-    cfg = DB_SLOW if db_key == "slow" else DB_FAST
-
-    # Pick a real doctor and a future time slot
-    slot_time = "2026-12-01 10:00:00"
-    doctor_id = 1
-    bookings = [
-        {"patient_id": 1, "name": "Patient A"},
-        {"patient_id": 2, "name": "Patient B"},
-    ]
-
-    results = [None, None]
-
-    def attempt_booking(index, patient_id, patient_name):
-        try:
-            conn = get_conn(cfg)
-            conn.autocommit = False
-            cur  = conn.cursor()
-
-            # Check if slot exists — lock it
-            cur.execute("""
-                SELECT id FROM appointments
-                WHERE doctor_id = %s
-                  AND scheduled_at = %s
-                  AND status = 'scheduled'
-                FOR UPDATE NOWAIT
-            """, [doctor_id, slot_time])
-            existing = cur.fetchone()
-
-            if existing:
-                conn.rollback()
-                results[index] = {
-                    "patient":  patient_name,
-                    "status":   "REJECTED",
-                    "reason":   f"Slot already taken (appointment id={existing[0]})",
-                    "pg_error": None,
-                    "color":    "red"
-                }
-                return
-
-            time.sleep(0.05)  # small delay so both threads overlap
-
-            cur.execute("""
-                INSERT INTO appointments
-                    (patient_id, doctor_id, scheduled_at, status)
-                VALUES (%s, %s, %s, 'scheduled')
-                RETURNING id
-            """, [patient_id, doctor_id, slot_time])
-            new_id = cur.fetchone()[0]
-            conn.commit()
-            results[index] = {
-                "patient":  patient_name,
-                "status":   "SUCCESS",
-                "reason":   f"Appointment created (id={new_id})",
-                "pg_error": None,
-                "color":    "green"
-            }
-
-        except psycopg2.errors.LockNotAvailable as e:
-            try: conn.rollback()
-            except: pass
-            results[index] = {
-                "patient":  patient_name,
-                "status":   "BLOCKED",
-                "reason":   "Could not acquire lock — another booking is in progress",
-                "pg_error": str(e).strip(),
-                "color":    "amber"
-            }
-        except Exception as e:
-            try: conn.rollback()
-            except: pass
-            results[index] = {
-                "patient":  patient_name,
-                "status":   "ERROR",
-                "reason":   "Database error",
-                "pg_error": str(e).strip(),
-                "color":    "red"
-            }
-
-    # Fire both simultaneously
-    t1 = threading.Thread(target=attempt_booking, args=(0, bookings[0]["patient_id"], bookings[0]["name"]))
-    t2 = threading.Thread(target=attempt_booking, args=(1, bookings[1]["patient_id"], bookings[1]["name"]))
-    t1.start(); t2.start()
-    t1.join();  t2.join()
-
-    # Count how many succeeded
-    succeeded = sum(1 for r in results if r and r["status"] == "SUCCESS")
-
-    # Clean up the test booking(s) so it can be run again
-    try:
-        conn = get_conn(cfg)
-        conn.autocommit = True
-        cur = conn.cursor()
-        cur.execute("DELETE FROM appointments WHERE doctor_id=%s AND scheduled_at=%s AND status='scheduled'",
-                    [doctor_id, slot_time])
-        conn.close()
-    except:
-        pass
-
-    return jsonify({
-        "slot":      f"Doctor #{doctor_id} @ {slot_time}",
-        "results":   results,
-        "succeeded": succeeded,
-        "verdict":   "⚠️ RACE CONDITION — both bookings succeeded!" if succeeded == 2
-                     else "✅ Conflict handled correctly — only one booking accepted" if succeeded == 1
-                     else "❌ Both bookings failed"
-    })
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  API: DEADLOCK SIMULATION
-# ─────────────────────────────────────────────────────────────────────────────
-@app.route("/api/deadlock", methods=["POST"])
-def api_deadlock():
-    """
-    Creates a real deadlock between two database sessions.
-    Session 1: locks billing id=1, then tries rooms id=1
-    Session 2: locks rooms  id=1, then tries billing id=1
-    PostgreSQL detects and kills one — we catch the error and return it.
-    """
-    data   = request.get_json() or {}
-    db_key = data.get("db", "slow")
-    cfg    = DB_SLOW if db_key == "slow" else DB_FAST
-
-    log = []
-    results = [None, None]
-
-    def session_1():
-        try:
-            conn = get_conn(cfg)
-            conn.autocommit = False
-            cur  = conn.cursor()
-            log.append("🔵 Session 1: BEGIN")
-            cur.execute("UPDATE rooms SET capacity = capacity WHERE id = 1")
-            log.append("🔵 Session 1: Locked rooms id=1")
-            time.sleep(0.3)   # wait so Session 2 can grab billing
-            log.append("🔵 Session 1: Trying to lock billing id=1 …")
-            cur.execute("UPDATE billing SET discount = discount WHERE id = 1")
-            conn.commit()
-            log.append("🔵 Session 1: COMMIT (survived)")
-            results[0] = {"session": "Session 1", "outcome": "SURVIVED", "color": "green", "pg_error": None}
-        except psycopg2.errors.DeadlockDetected as e:
-            try: conn.rollback()
-            except: pass
-            log.append("🔵 Session 1: ❌ DEADLOCK — rolled back")
-            results[0] = {"session": "Session 1", "outcome": "DEADLOCK — rolled back by PostgreSQL",
-                          "color": "red", "pg_error": str(e).strip()}
-        except Exception as e:
-            try: conn.rollback()
-            except: pass
-            results[0] = {"session": "Session 1", "outcome": "ERROR", "color": "red", "pg_error": str(e).strip()}
-
-    def session_2():
-        time.sleep(0.1)  # let session 1 get its lock first
-        try:
-            conn = get_conn(cfg)
-            conn.autocommit = False
-            cur  = conn.cursor()
-            log.append("🟡 Session 2: BEGIN")
-            cur.execute("UPDATE billing SET discount = discount WHERE id = 1")
-            log.append("🟡 Session 2: Locked billing id=1")
-            time.sleep(0.3)
-            log.append("🟡 Session 2: Trying to lock rooms id=1 …")
-            cur.execute("UPDATE rooms SET capacity = capacity WHERE id = 1")
-            conn.commit()
-            log.append("🟡 Session 2: COMMIT (survived)")
-            results[1] = {"session": "Session 2", "outcome": "SURVIVED", "color": "green", "pg_error": None}
-        except psycopg2.errors.DeadlockDetected as e:
-            try: conn.rollback()
-            except: pass
-            log.append("🟡 Session 2: ❌ DEADLOCK — rolled back")
-            results[1] = {"session": "Session 2", "outcome": "DEADLOCK — rolled back by PostgreSQL",
-                          "color": "red", "pg_error": str(e).strip()}
-        except Exception as e:
-            try: conn.rollback()
-            except: pass
-            results[1] = {"session": "Session 2", "outcome": "ERROR", "color": "red", "pg_error": str(e).strip()}
-
-    t1 = threading.Thread(target=session_1)
-    t2 = threading.Thread(target=session_2)
-    t1.start(); t2.start()
-    t1.join();  t2.join()
-
-    deadlock_occurred = any(r and "DEADLOCK" in r["outcome"] for r in results if r)
-
-    return jsonify({
-        "log":              log,
-        "results":          results,
-        "deadlock_occurred": deadlock_occurred,
-        "explanation": (
-            "PostgreSQL detected a circular wait: Session 1 held rooms and waited for billing, "
-            "while Session 2 held billing and waited for rooms. "
-            "PostgreSQL automatically chose one victim and rolled it back."
-        ) if deadlock_occurred else "No deadlock detected — try again."
-    })
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  API: BACKUP
@@ -541,133 +334,6 @@ def api_sandbox():
 
     return jsonify({"results": results, "speedup": speedup})
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  API: TRANSACTION VISUALIZER — persistent session-based transactions
-# ─────────────────────────────────────────────────────────────────────────────
-txn_sessions  = {}   # {session_id: {conn, cur, db, log, status}}
-txn_lock      = threading.Lock()
-
-
-def _get_txn(sid):
-    with txn_lock:
-        return txn_sessions.get(sid)
-
-
-def _close_txn(sid):
-    with txn_lock:
-        s = txn_sessions.pop(sid, None)
-    if s:
-        try: s["conn"].close()
-        except: pass
-
-
-@app.route("/api/txn/begin", methods=["POST"])
-def txn_begin():
-    data   = request.get_json() or {}
-    sid    = data.get("session_id")
-    db_key = data.get("db", "slow")
-    iso    = data.get("isolation", "READ COMMITTED")
-    cfg    = DB_SLOW if db_key == "slow" else DB_FAST
-
-    # Close any existing session with this ID
-    _close_txn(sid)
-
-    try:
-        conn = get_conn(cfg)
-        conn.autocommit = False
-        cur  = conn.cursor()
-        cur.execute(f"SET TRANSACTION ISOLATION LEVEL {iso}")
-        with txn_lock:
-            txn_sessions[sid] = {
-                "conn": conn, "cur": cur,
-                "db": db_key, "iso": iso,
-                "log": [f"BEGIN ({iso})"],
-                "status": "open"
-            }
-        return jsonify({"ok": True, "message": f"Transaction started on hospital_{db_key} ({iso})",
-                        "log": [f"BEGIN ({iso})"], "status": "open"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
-@app.route("/api/txn/execute", methods=["POST"])
-def txn_execute():
-    data = request.get_json() or {}
-    sid  = data.get("session_id")
-    sql  = data.get("sql", "").strip()
-
-    s = _get_txn(sid)
-    if not s:
-        return jsonify({"ok": False, "error": "No open transaction. Click BEGIN first."})
-    if s["status"] != "open":
-        return jsonify({"ok": False, "error": f"Transaction is already {s['status']}."})
-
-    try:
-        cur = s["cur"]
-        cur.execute(sql)
-        try:
-            rows = cur.fetchall()
-            row_str = f"{len(rows)} row(s) returned" if rows else "OK"
-            preview = [list(r) for r in rows[:10]]
-        except:
-            row_str = f"{cur.rowcount} row(s) affected"
-            preview = []
-        msg = f"→ {sql[:60]}{'…' if len(sql)>60 else ''} [{row_str}]"
-        s["log"].append(msg)
-        return jsonify({"ok": True, "message": msg, "preview": preview,
-                        "log": s["log"], "status": s["status"]})
-    except Exception as e:
-        err_msg = str(e).strip()
-        s["log"].append(f"❌ ERROR: {err_msg}")
-        # Transaction is now aborted — must rollback before doing anything else
-        s["status"] = "error"
-        return jsonify({"ok": False, "error": err_msg, "log": s["log"], "status": "error"})
-
-
-@app.route("/api/txn/commit", methods=["POST"])
-def txn_commit():
-    data = request.get_json() or {}
-    sid  = data.get("session_id")
-    s    = _get_txn(sid)
-    if not s:
-        return jsonify({"ok": False, "error": "No open transaction."})
-    try:
-        s["conn"].commit()
-        s["log"].append("✅ COMMIT — changes are now permanent")
-        s["status"] = "committed"
-        log = s["log"][:]
-        _close_txn(sid)
-        return jsonify({"ok": True, "message": "COMMIT successful", "log": log, "status": "committed"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
-@app.route("/api/txn/rollback", methods=["POST"])
-def txn_rollback():
-    data = request.get_json() or {}
-    sid  = data.get("session_id")
-    s    = _get_txn(sid)
-    if not s:
-        return jsonify({"ok": False, "error": "No open transaction."})
-    try:
-        s["conn"].rollback()
-        s["log"].append("↩️ ROLLBACK — all changes undone")
-        s["status"] = "rolled_back"
-        log = s["log"][:]
-        _close_txn(sid)
-        return jsonify({"ok": True, "message": "ROLLBACK complete", "log": log, "status": "rolled_back"})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
-
-
-@app.route("/api/txn/status", methods=["GET"])
-def txn_status():
-    sid = request.args.get("session_id")
-    s   = _get_txn(sid)
-    if not s:
-        return jsonify({"status": "idle", "log": []})
-    return jsonify({"status": s["status"], "db": s["db"], "iso": s["iso"], "log": s["log"]})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1045,11 +711,9 @@ pre,code{font-family:var(--mono)}
     <div class="tab" data-page="indexlab">🧪 Index Lab</div>
     <div class="tab" data-page="performance">⚡ Performance Lab</div>
     <div class="tab" data-page="indexes">🗂 Index Inspector</div>
-    <div class="tab" data-page="concurrency">🔀 Concurrency Lab</div>
-    <div class="tab" data-page="deadlock">💥 Deadlock Lab</div>
+    <div class="tab" data-page="txlab">🔁 Transaction Lab</div>
     <div class="tab" data-page="backup">💾 Backup Lab</div>
     <div class="tab" data-page="sandbox">🔬 SQL Sandbox</div>
-    <div class="tab" data-page="txn">📋 Tx Visualizer</div>
   </div>
   <div class="nav-badge">Advanced Database — Final Project</div>
 </nav>
@@ -1138,103 +802,6 @@ pre,code{font-family:var(--mono)}
         <div class="terminal tall" id="perf-fast-plan">Run a query to see the plan…</div>
       </div>
     </div>
-  </div>
-</div>
-
-<!-- ══════════════════════════════════════════════════════ PAGE: CONCURRENCY ══ -->
-<div id="page-concurrency" class="page">
-  <div class="sec">Concurrency Lab — Double Booking Simulation</div>
-
-  <div class="grid-2" style="margin-bottom:24px">
-    <div class="card">
-      <div class="card-title">🏥 What happens here?</div>
-      <div class="card-sub">
-        Two patients try to book the exact same doctor at the exact same time slot.
-        Only one should succeed. This button fires <b>two simultaneous database requests</b>
-        — if there's no protection, both succeed (a real data bug).
-        If the transaction is designed correctly, one will be rejected.
-      </div>
-      <div class="card-sub" style="color:var(--amber)">
-        <b>Target:</b> Doctor #1 @ 2026-12-01 10:00 AM
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">📋 What to look for</div>
-      <div class="card-sub" style="line-height:1.8">
-        ✅ <b>Correct</b> — One booking succeeds, one is rejected or blocked<br>
-        ⚠️ <b>Bug</b> — Both bookings succeed → double booking<br>
-        💬 <b>PostgreSQL error</b> shown in the result cards below<br>
-        🔔 The actual <code>psycopg2</code> / PostgreSQL message is displayed as-is
-      </div>
-    </div>
-  </div>
-
-  <div class="card-title" style="margin-bottom:12px">Test on which database?</div>
-  <div class="db-toggle">
-    <button class="db-toggle-btn active-slow" id="conc-slow-btn" onclick="setConcDb('slow')">
-      🔴 hospital_slow
-    </button>
-    <button class="db-toggle-btn" id="conc-fast-btn" onclick="setConcDb('fast')">
-      🟢 hospital_fast
-    </button>
-  </div>
-
-  <div class="btn-group">
-    <button class="btn btn-danger" id="btn-book" onclick="runConcurrent()">
-      🚦 Simulate Double Booking
-    </button>
-    <span id="conc-status" style="font-size:.75rem;color:var(--muted)"></span>
-  </div>
-
-  <div id="conc-result" style="display:none">
-    <div class="session-grid" id="conc-sessions"></div>
-    <div class="verdict" id="conc-verdict"></div>
-  </div>
-</div>
-
-<!-- ══════════════════════════════════════════════════════ PAGE: DEADLOCK ══ -->
-<div id="page-deadlock" class="page">
-  <div class="sec">Deadlock Lab</div>
-
-  <div class="grid-2" style="margin-bottom:24px">
-    <div class="card">
-      <div class="card-title">💥 How the deadlock is triggered</div>
-      <div class="card-sub" style="font-family:var(--mono);font-size:.72rem;line-height:2">
-        Session 1: LOCK rooms id=1  →  wait for billing id=1<br>
-        Session 2: LOCK billing id=1 →  wait for rooms id=1<br>
-        <br>
-        Circular dependency → PostgreSQL detects → kills one session
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">📋 What to look for</div>
-      <div class="card-sub" style="line-height:1.8">
-        💬 <b>Real PostgreSQL error</b> message: <br>
-        <code style="color:var(--slow);font-size:.7rem">ERROR: deadlock detected<br>DETAIL: Process N waits for ShareLock…</code><br><br>
-        ✅ One session survives, one is rolled back automatically<br>
-        📜 The event log shows the sequence of locks
-      </div>
-    </div>
-  </div>
-
-  <div class="card-title" style="margin-bottom:12px">Test on which database?</div>
-  <div class="db-toggle">
-    <button class="db-toggle-btn active-slow" id="dl-slow-btn" onclick="setDlDb('slow')">🔴 hospital_slow</button>
-    <button class="db-toggle-btn" id="dl-fast-btn" onclick="setDlDb('fast')">🟢 hospital_fast</button>
-  </div>
-
-  <div class="btn-group">
-    <button class="btn btn-danger" id="btn-deadlock" onclick="runDeadlock()">💥 Trigger Deadlock</button>
-    <span id="dl-status" style="font-size:.75rem;color:var(--muted)"></span>
-  </div>
-
-  <div id="dl-result" style="display:none">
-    <div class="sec" style="margin-bottom:8px">Event Log</div>
-    <div class="log-box" id="dl-log"></div>
-
-    <div class="session-grid" style="margin-top:16px" id="dl-sessions"></div>
-
-    <div class="result-box result-info" style="margin-top:16px" id="dl-explanation"></div>
   </div>
 </div>
 
@@ -1513,93 +1080,6 @@ async function runSelectedPerf() {
 document.querySelector('.tab[data-page="performance"]').addEventListener('click', loadPerfQueries);
 
 
-// ── CONCURRENCY LAB ──
-let concDb = 'slow';
-function setConcDb(db) {
-  concDb = db;
-  document.getElementById('conc-slow-btn').className = 'db-toggle-btn' + (db==='slow' ? ' active-slow' : '');
-  document.getElementById('conc-fast-btn').className = 'db-toggle-btn' + (db==='fast' ? ' active-fast' : '');
-}
-
-async function runConcurrent() {
-  const btn = document.getElementById('btn-book');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Firing two simultaneous requests…';
-  document.getElementById('conc-status').textContent = '';
-  document.getElementById('conc-result').style.display = 'none';
-
-  const r = await fetch('/api/concurrent-book', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({db: concDb})
-  }).then(r => r.json());
-
-  document.getElementById('conc-result').style.display = 'block';
-
-  const colorMap = {green:'badge-success', red:'badge-error', amber:'badge-warn'};
-  document.getElementById('conc-sessions').innerHTML = r.results.map((res,i) => `
-    <div class="session-card">
-      <div class="session-header">
-        <div class="session-name">🙋 ${res.patient}</div>
-        <span class="outcome-badge ${colorMap[res.color]||'badge-warn'}">${res.status}</span>
-      </div>
-      <div style="font-size:.78rem;color:var(--muted2)">${res.reason}</div>
-      ${res.pg_error ? `<div class="pg-err">PostgreSQL says:\n${res.pg_error}</div>` : ''}
-    </div>`).join('');
-
-  const succeeded = r.succeeded;
-  const vCls = succeeded === 1 ? 'verdict-ok' : succeeded === 2 ? 'verdict-bad' : 'verdict-warn';
-  document.getElementById('conc-verdict').className = `verdict ${vCls}`;
-  document.getElementById('conc-verdict').textContent = r.verdict;
-
-  btn.disabled = false;
-  btn.innerHTML = '🚦 Simulate Double Booking';
-}
-
-// ── DEADLOCK LAB ──
-let dlDb = 'slow';
-function setDlDb(db) {
-  dlDb = db;
-  document.getElementById('dl-slow-btn').className = 'db-toggle-btn' + (db==='slow' ? ' active-slow' : '');
-  document.getElementById('dl-fast-btn').className = 'db-toggle-btn' + (db==='fast' ? ' active-fast' : '');
-}
-
-async function runDeadlock() {
-  const btn = document.getElementById('btn-deadlock');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Creating deadlock…';
-  document.getElementById('dl-result').style.display = 'none';
-
-  const r = await fetch('/api/deadlock', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({db: dlDb})
-  }).then(r => r.json());
-
-  document.getElementById('dl-result').style.display = 'block';
-  document.getElementById('dl-log').innerHTML = (r.log||[]).join('\n');
-
-  const colorMap = {green:'badge-success', red:'badge-error'};
-  document.getElementById('dl-sessions').innerHTML = (r.results||[]).map(res => {
-    if (!res) return '';
-    const isDeadlock = res.outcome.includes('DEADLOCK');
-    return `
-      <div class="session-card">
-        <div class="session-header">
-          <div class="session-name">${res.session}</div>
-          <span class="outcome-badge ${isDeadlock?'badge-error':'badge-success'}">${isDeadlock?'💀 KILLED':'✅ SURVIVED'}</span>
-        </div>
-        <div style="font-size:.78rem;color:var(--muted2)">${res.outcome}</div>
-        ${res.pg_error ? `<div class="pg-err">PostgreSQL error:\n${res.pg_error}</div>` : ''}
-      </div>`;
-  }).join('');
-
-  const exEl = document.getElementById('dl-explanation');
-  exEl.className = r.deadlock_occurred ? 'result-box result-info' : 'result-box result-warn';
-  exEl.textContent = r.explanation;
-
-  btn.disabled = false;
-  btn.innerHTML = '💥 Trigger Deadlock';
-}
-
 // ── INDEX INSPECTOR ──
 async function loadIndexes(dbKey) {
   const r = await fetch(`/api/indexes/${dbKey}`).then(r => r.json());
@@ -1806,115 +1286,33 @@ async function runBackup() {
   </div>
 </div>
 
-<!-- ══════════════════════════════════════════════════════ PAGE: TX VISUALIZER ══ -->
-<div id="page-txn" class="page">
-  <div class="sec">📋 Transaction Visualizer — Step-by-Step in Two Sessions</div>
+<!-- ══════════════════════════════════════════════════════ PAGE: TRANSACTION LAB ══ -->
+<div id="page-txlab" class="page">
+  <div class="sec">🔁 Transaction Lab — Concurrency Problems</div>
 
-  <div class="result-info" style="font-size:.78rem;margin-bottom:20px;line-height:1.7">
-    Each panel is an <b>independent real database connection</b> with its own open transaction.
-    Click steps in any order across both sessions to see blocking, isolation, and commit/rollback behavior.
-    The transaction stays open on the server until you COMMIT or ROLLBACK.
+  <div class="result-info" style="font-size:.78rem;margin-bottom:16px;line-height:1.8">
+    Each slot below is one classic concurrency problem. For each one you have to <b>invent your own hospital scenario</b>
+    (do <b>not</b> reuse the slide example), write the SQL that <b>causes</b> the bug across two sessions, then write the SQL that <b>fixes</b> it.
+    <br>
+    <span style="color:var(--amber)">All 5 slots are required. Run your SQL in two pgAdmin Query Tool tabs (use the Copy buttons on each slot).</span>
   </div>
 
-  <div style="font-size:.72rem;color:var(--amber);background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.2);
-              border-radius:var(--r-sm);padding:10px 14px;margin-bottom:20px">
-    💡 <b>Try this:</b> Session A — BEGIN → UPDATE patient id=1 → (don't commit yet).
-    Session B — BEGIN → try to UPDATE the same row → it will <b>BLOCK</b> because Session A holds the lock.
-    Then COMMIT Session A and watch Session B unblock.
-  </div>
-
-  <div class="grid-2" id="txn-grid">
-
-    <!-- SESSION A -->
-    <div class="card" id="txn-card-a">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-        <div style="display:flex;align-items:center;gap:10px">
-          <div style="font-size:.95rem;font-weight:800">Session A</div>
-          <span id="txn-a-status-badge" class="outcome-badge badge-warn">IDLE</span>
+  <!-- Progress bar -->
+  <div class="card" style="margin-bottom:20px;padding:16px 20px">
+    <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px">
+      <div style="font-size:.8rem;font-weight:700">Progress</div>
+      <div style="flex:1;min-width:180px">
+        <div class="bar-track" style="height:10px">
+          <div class="bar-fill bar-fast" id="txlab-progress-bar" style="width:0%;background:var(--fast)"></div>
         </div>
       </div>
-
-      <!-- Config row -->
-      <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-        <select id="txn-a-db" style="background:var(--bg2);border:1px solid var(--border);
-            border-radius:var(--r-sm);padding:7px 12px;color:var(--text);font-size:.75rem;font-family:inherit">
-          <option value="slow">hospital_slow</option>
-          <option value="fast">hospital_fast</option>
-        </select>
-        <select id="txn-a-iso" style="background:var(--bg2);border:1px solid var(--border);
-            border-radius:var(--r-sm);padding:7px 12px;color:var(--text);font-size:.75rem;font-family:inherit">
-          <option value="READ COMMITTED">READ COMMITTED</option>
-          <option value="REPEATABLE READ">REPEATABLE READ</option>
-          <option value="SERIALIZABLE">SERIALIZABLE</option>
-        </select>
-      </div>
-
-      <!-- SQL input -->
-      <textarea id="txn-a-sql" rows="3" style="
-          width:100%;background:#030810;border:1px solid var(--border);
-          border-radius:var(--r-sm);padding:10px;color:var(--text);
-          font-family:var(--mono);font-size:.72rem;resize:vertical;margin-bottom:10px"
-        placeholder="UPDATE patients SET city = 'Cairo' WHERE id = 1"></textarea>
-
-      <!-- Action buttons -->
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
-        <button class="btn btn-primary" style="padding:8px 14px;font-size:.75rem" onclick="txnAction('a','begin')">BEGIN</button>
-        <button class="btn btn-ghost"   style="padding:8px 14px;font-size:.75rem" onclick="txnAction('a','execute')" id="txn-a-exec" disabled>EXECUTE</button>
-        <button class="btn btn-success" style="padding:8px 14px;font-size:.75rem" onclick="txnAction('a','commit')"  id="txn-a-commit" disabled>COMMIT</button>
-        <button class="btn btn-danger"  style="padding:8px 14px;font-size:.75rem" onclick="txnAction('a','rollback')" id="txn-a-rollback" disabled>ROLLBACK</button>
-      </div>
-
-      <!-- Response -->
-      <div id="txn-a-response" style="margin-bottom:10px;min-height:32px"></div>
-
-      <!-- Log -->
-      <div style="font-size:.65rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Transaction Log</div>
-      <div class="log-box" id="txn-a-log">Idle — click BEGIN to start a transaction</div>
+      <div id="txlab-progress-text" style="font-size:.8rem;font-weight:800;color:var(--fast)">0 / 5</div>
     </div>
-
-    <!-- SESSION B -->
-    <div class="card" id="txn-card-b">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-        <div style="display:flex;align-items:center;gap:10px">
-          <div style="font-size:.95rem;font-weight:800">Session B</div>
-          <span id="txn-b-status-badge" class="outcome-badge badge-warn">IDLE</span>
-        </div>
-      </div>
-
-      <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-        <select id="txn-b-db" style="background:var(--bg2);border:1px solid var(--border);
-            border-radius:var(--r-sm);padding:7px 12px;color:var(--text);font-size:.75rem;font-family:inherit">
-          <option value="slow">hospital_slow</option>
-          <option value="fast">hospital_fast</option>
-        </select>
-        <select id="txn-b-iso" style="background:var(--bg2);border:1px solid var(--border);
-            border-radius:var(--r-sm);padding:7px 12px;color:var(--text);font-size:.75rem;font-family:inherit">
-          <option value="READ COMMITTED">READ COMMITTED</option>
-          <option value="REPEATABLE READ">REPEATABLE READ</option>
-          <option value="SERIALIZABLE">SERIALIZABLE</option>
-        </select>
-      </div>
-
-      <textarea id="txn-b-sql" rows="3" style="
-          width:100%;background:#030810;border:1px solid var(--border);
-          border-radius:var(--r-sm);padding:10px;color:var(--text);
-          font-family:var(--mono);font-size:.72rem;resize:vertical;margin-bottom:10px"
-        placeholder="SELECT city FROM patients WHERE id = 1"></textarea>
-
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px">
-        <button class="btn btn-primary" style="padding:8px 14px;font-size:.75rem" onclick="txnAction('b','begin')">BEGIN</button>
-        <button class="btn btn-ghost"   style="padding:8px 14px;font-size:.75rem" onclick="txnAction('b','execute')" id="txn-b-exec" disabled>EXECUTE</button>
-        <button class="btn btn-success" style="padding:8px 14px;font-size:.75rem" onclick="txnAction('b','commit')"  id="txn-b-commit" disabled>COMMIT</button>
-        <button class="btn btn-danger"  style="padding:8px 14px;font-size:.75rem" onclick="txnAction('b','rollback')" id="txn-b-rollback" disabled>ROLLBACK</button>
-      </div>
-
-      <div id="txn-b-response" style="margin-bottom:10px;min-height:32px"></div>
-
-      <div style="font-size:.65rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px">Transaction Log</div>
-      <div class="log-box" id="txn-b-log">Idle — click BEGIN to start a transaction</div>
-    </div>
-
+    <div style="font-size:.68rem;color:var(--muted)">A slot counts as complete when all fields below are filled. Progress is saved in your browser.</div>
   </div>
+
+  <!-- 5 fixed slots -->
+  <div id="txlab-slots"></div>
 </div>
 
 <!-- ══════════════════════════════════════════════════════ PAGE: INDEX LAB ══ -->
@@ -2044,99 +1442,6 @@ async function runSandbox() {
   btn.disabled = false; btn.innerHTML = '▶ Run Query';
 }
 
-// ── TRANSACTION VISUALIZER ──
-const txnIDs = { a: 'txn-session-A-' + Math.random().toString(36).slice(2),
-                 b: 'txn-session-B-' + Math.random().toString(36).slice(2) };
-
-const statusCls = {
-  idle:        'badge-warn',
-  open:        'badge-success',
-  committed:   'badge-success',
-  rolled_back: 'badge-warn',
-  error:       'badge-error'
-};
-const statusLabel = {
-  idle:'IDLE', open:'IN TXN', committed:'COMMITTED', rolled_back:'ROLLED BACK', error:'ERROR'
-};
-
-function setTxnStatus(sess, status) {
-  const badge = document.getElementById(`txn-${sess}-status-badge`);
-  badge.className = `outcome-badge ${statusCls[status] || 'badge-warn'}`;
-  badge.textContent = statusLabel[status] || status.toUpperCase();
-
-  const isOpen = status === 'open';
-  document.getElementById(`txn-${sess}-exec`).disabled     = !isOpen;
-  document.getElementById(`txn-${sess}-commit`).disabled   = !isOpen;
-  document.getElementById(`txn-${sess}-rollback`).disabled = !isOpen;
-
-  const card = document.getElementById(`txn-card-${sess}`);
-  card.style.borderColor = status === 'open'        ? 'rgba(59,130,246,.4)'
-                         : status === 'committed'   ? 'rgba(16,185,129,.4)'
-                         : status === 'rolled_back' ? 'rgba(245,158,11,.4)'
-                         : status === 'error'       ? 'rgba(239,68,68,.4)'
-                         : 'var(--border)';
-}
-
-function updateTxnLog(sess, log, status) {
-  const el = document.getElementById(`txn-${sess}-log`);
-  el.textContent = log.join('\n');
-  el.scrollTop = el.scrollHeight;
-  setTxnStatus(sess, status || 'idle');
-}
-
-async function txnAction(sess, action) {
-  const sid  = txnIDs[sess];
-  const db   = document.getElementById(`txn-${sess}-db`).value;
-  const iso  = document.getElementById(`txn-${sess}-iso`).value;
-  const sql  = document.getElementById(`txn-${sess}-sql`).value.trim();
-  const resp = document.getElementById(`txn-${sess}-response`);
-
-  resp.innerHTML = '<span class="spin" style="width:12px;height:12px"></span>';
-
-  let r;
-  if (action === 'begin') {
-    r = await fetch('/api/txn/begin', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: sid, db, isolation: iso})
-    }).then(x => x.json());
-  } else if (action === 'execute') {
-    if (!sql) { resp.innerHTML = '<span style="color:var(--amber);font-size:.75rem">Write a SQL statement first.</span>'; return; }
-    r = await fetch('/api/txn/execute', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: sid, sql})
-    }).then(x => x.json());
-  } else if (action === 'commit') {
-    r = await fetch('/api/txn/commit', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: sid})
-    }).then(x => x.json());
-  } else if (action === 'rollback') {
-    r = await fetch('/api/txn/rollback', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({session_id: sid})
-    }).then(x => x.json());
-  }
-
-  if (r.log) updateTxnLog(sess, r.log, r.status);
-
-  if (r.ok) {
-    const cls = r.status === 'committed' ? 'result-success'
-              : r.status === 'rolled_back' ? 'result-warn'
-              : 'result-info';
-    resp.innerHTML = `<div class="result-box ${cls}" style="padding:8px 12px;font-size:.75rem;margin-top:0">${r.message}</div>`;
-
-    // Show data preview if execute returned rows
-    if (action === 'execute' && r.preview && r.preview.length) {
-      const preview = r.preview.map(row => `<tr>${row.map(v=>`<td>${v??''}</td>`).join('')}</tr>`).join('');
-      resp.innerHTML += `<div style="overflow-x:auto;margin-top:8px">
-        <table class="idx-table"><tbody>${preview}</tbody></table>
-      </div>`;
-    }
-  } else {
-    resp.innerHTML = `<div class="pg-err" style="margin-top:0">❌ ${r.error}</div>`;
-    if (r.status) setTxnStatus(sess, r.status);
-  }
-}
 
 // ── INDEX LAB ──
 const LAB_SCENARIOS = [
@@ -2380,6 +1685,250 @@ function clearLabSlot(idx){
 }
 
 document.querySelector('.tab[data-page="indexlab"]').addEventListener('click', renderLabAll);
+
+// ── TRANSACTION LAB ──
+const TX_PROBLEMS = [
+  { name:'Lost Update',
+    desc:'Two sessions read the same row, both compute a new value, both write it back. One of the writes silently disappears.' },
+  { name:'Non-Repeatable Read',
+    desc:'Same SELECT in one transaction returns different values because another session UPDATEd and committed the row in between.' },
+  { name:'Phantom Read',
+    desc:'Same COUNT/SELECT in one transaction returns a different set of rows because another session INSERTed (or DELETEd) a matching row in between.' },
+  { name:'Dirty Read attempt',
+    desc:"Try to read another session's uncommitted change at READ UNCOMMITTED. PostgreSQL refuses. Explain why MVCC makes this physically impossible." },
+  { name:'Deadlock',
+    desc:'Two sessions each hold a lock the other one wants. PostgreSQL detects the cycle and kills one. Fix it with a consistent lock-acquisition order.' },
+];
+
+const TXLAB_KEY = 'txnLab_v1';
+const blankTxSlot = i => ({
+  id: i,
+  scenario: '',
+  sessionABuggy: '',
+  sessionBBuggy: '',
+  badOutcome: '',
+  sessionAFixed: '',
+  sessionBFixed: '',
+  whyBug: '',
+  whyFix: '',
+});
+
+let txLabSlots = (() => {
+  try {
+    const d = JSON.parse(localStorage.getItem(TXLAB_KEY));
+    if (d && d.length === TX_PROBLEMS.length) return d;
+  } catch(e){}
+  return TX_PROBLEMS.map((_,i) => blankTxSlot(i));
+})();
+
+function saveTxLabSlots() { localStorage.setItem(TXLAB_KEY, JSON.stringify(txLabSlots)); }
+
+function txSlotComplete(s) {
+  return ['scenario','sessionABuggy','sessionBBuggy','badOutcome',
+          'sessionAFixed','sessionBFixed','whyBug','whyFix']
+    .every(k => (s[k]||'').trim().length > 0);
+}
+
+function txSlotEmpty(s) {
+  return ['scenario','sessionABuggy','sessionBBuggy','badOutcome',
+          'sessionAFixed','sessionBFixed','whyBug','whyFix']
+    .every(k => !(s[k]||'').trim());
+}
+
+function txSlotStatus(s) {
+  if (txSlotComplete(s)) return 'complete';
+  if (txSlotEmpty(s))    return 'empty';
+  return 'partial';
+}
+
+const txStatusInfo = {
+  empty:    { icon:'⬜', label:'Not started', col:'var(--muted)' },
+  partial:  { icon:'✏️', label:'In progress', col:'var(--amber)' },
+  complete: { icon:'✅', label:'Complete',    col:'var(--fast)'  },
+};
+
+function updateTxLabProgress() {
+  const done = txLabSlots.filter(s => txSlotComplete(s)).length;
+  document.getElementById('txlab-progress-bar').style.width = (done/TX_PROBLEMS.length*100)+'%';
+  document.getElementById('txlab-progress-text').textContent = `${done} / ${TX_PROBLEMS.length}`;
+}
+
+function escAttr(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function escText(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function txTa(id, rows, val, ph, cb) {
+  return `<textarea id="${id}" rows="${rows}" oninput="${cb}"
+    style="width:100%;margin-top:5px;background:#030810;border:1px solid var(--border);
+           border-radius:var(--r-sm);padding:10px 12px;color:var(--text);font-family:var(--mono);
+           font-size:.72rem;line-height:1.6;resize:vertical;transition:border .2s"
+    placeholder="${escAttr(ph)}"
+    onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'"
+  >${escText(val)}</textarea>`;
+}
+
+function txTaPlain(id, rows, val, ph, cb) {
+  return `<textarea id="${id}" rows="${rows}" oninput="${cb}"
+    style="width:100%;margin-top:5px;background:#030810;border:1px solid var(--border);
+           border-radius:var(--r-sm);padding:10px 12px;color:var(--text);font-family:inherit;
+           font-size:.78rem;line-height:1.6;resize:vertical;transition:border .2s"
+    placeholder="${escAttr(ph)}"
+    onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'"
+  >${escText(val)}</textarea>`;
+}
+
+function renderTxLabSlot(idx) {
+  const s = txLabSlots[idx];
+  const p = TX_PROBLEMS[idx];
+  const st = txStatusInfo[txSlotStatus(s)];
+
+  return `<div class="card" style="margin-bottom:20px" id="txlab-slot-${idx}">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-size:.95rem;font-weight:800;color:var(--muted2)">#${idx+1}</span>
+        <span style="font-size:.95rem;font-weight:800">${p.name}</span>
+        <span style="font-size:.75rem;font-weight:700;color:${st.col}">${st.icon} ${st.label}</span>
+      </div>
+      <button onclick="clearTxLabSlot(${idx})" style="font-size:.65rem;color:var(--muted);background:none;border:1px solid var(--border);cursor:pointer;padding:3px 10px;border-radius:4px"
+        onmouseover="this.style.color='var(--slow)'" onmouseout="this.style.color='var(--muted)'">🗑 Clear</button>
+    </div>
+    <div style="font-size:.74rem;color:var(--muted);margin-bottom:14px;line-height:1.6">${p.desc}</div>
+
+    <!-- Scenario -->
+    <div style="margin-bottom:14px">
+      <label style="font-size:.67rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Your hospital scenario *</label>
+      ${txTaPlain(`txlab-scenario-${idx}`, 2, s.scenario,
+        'Invent a hospital situation that triggers this problem. Do not reuse the slide example.',
+        `txField(${idx},'scenario',this.value)`)}
+    </div>
+
+    <!-- BUGGY VERSION -->
+    <div style="border:1px solid rgba(239,68,68,.25);border-radius:var(--r-sm);padding:14px;margin-bottom:14px;background:rgba(239,68,68,.04)">
+      <div style="font-size:.78rem;font-weight:800;color:var(--slow);margin-bottom:10px">Buggy version - make the problem happen</div>
+
+      <div style="margin-bottom:10px">
+        <label style="font-size:.65rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Session A - buggy SQL *</label>
+        ${txTa(`txlab-aBug-${idx}`, 4, s.sessionABuggy,
+          'BEGIN; SELECT ...; -- do not commit yet',
+          `txField(${idx},'sessionABuggy',this.value)`)}
+      </div>
+      <div style="margin-bottom:10px">
+        <label style="font-size:.65rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Session B - buggy SQL *</label>
+        ${txTa(`txlab-bBug-${idx}`, 4, s.sessionBBuggy,
+          'BEGIN; SELECT ...; UPDATE ...; COMMIT;',
+          `txField(${idx},'sessionBBuggy',this.value)`)}
+      </div>
+      <div style="margin-bottom:10px">
+        <label style="font-size:.65rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">What went wrong (the bad outcome you observed) *</label>
+        ${txTaPlain(`txlab-bad-${idx}`, 2, s.badOutcome,
+          'Describe what you saw - wrong final value, mismatched count, error message, etc.',
+          `txField(${idx},'badOutcome',this.value)`)}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-ghost" style="padding:7px 14px;font-size:.72rem" onclick="copyTxSql(${idx},'sessionABuggy', this)">Copy Session A SQL</button>
+        <button class="btn btn-ghost" style="padding:7px 14px;font-size:.72rem" onclick="copyTxSql(${idx},'sessionBBuggy', this)">Copy Session B SQL</button>
+        <span style="font-size:.7rem;color:var(--muted)">Paste each into its own pgAdmin Query Tool tab</span>
+      </div>
+    </div>
+
+    <!-- FIXED VERSION -->
+    <div style="border:1px solid rgba(16,185,129,.25);border-radius:var(--r-sm);padding:14px;margin-bottom:14px;background:rgba(16,185,129,.04)">
+      <div style="font-size:.78rem;font-weight:800;color:var(--fast);margin-bottom:10px">Fixed version - make the problem go away</div>
+
+      <div style="margin-bottom:10px">
+        <label style="font-size:.65rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Session A - fixed SQL *</label>
+        ${txTa(`txlab-aFix-${idx}`, 4, s.sessionAFixed,
+          'BEGIN; SELECT ... FOR UPDATE; UPDATE ...; COMMIT;',
+          `txField(${idx},'sessionAFixed',this.value)`)}
+      </div>
+      <div style="margin-bottom:10px">
+        <label style="font-size:.65rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Session B - fixed SQL *</label>
+        ${txTa(`txlab-bFix-${idx}`, 4, s.sessionBFixed,
+          'BEGIN; SELECT ... FOR UPDATE; UPDATE ...; COMMIT;',
+          `txField(${idx},'sessionBFixed',this.value)`)}
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-ghost" style="padding:7px 14px;font-size:.72rem" onclick="copyTxSql(${idx},'sessionAFixed', this)">Copy Session A SQL</button>
+        <button class="btn btn-ghost" style="padding:7px 14px;font-size:.72rem" onclick="copyTxSql(${idx},'sessionBFixed', this)">Copy Session B SQL</button>
+      </div>
+    </div>
+
+    <!-- WHY -->
+    <div style="margin-bottom:10px">
+      <label style="font-size:.67rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Why the bug happened *</label>
+      ${txTaPlain(`txlab-whyBug-${idx}`, 2, s.whyBug,
+        'Explain in your own words why your buggy version produces the bad outcome.',
+        `txField(${idx},'whyBug',this.value)`)}
+    </div>
+    <div style="margin-bottom:0">
+      <label style="font-size:.67rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Why the fix works *</label>
+      ${txTaPlain(`txlab-whyFix-${idx}`, 2, s.whyFix,
+        'Explain why your fixed version prevents the bug.',
+        `txField(${idx},'whyFix',this.value)`)}
+    </div>
+  </div>`;
+}
+
+function renderTxLabAll() {
+  const host = document.getElementById('txlab-slots');
+  if (!host) { console.error('txlab-slots div not found'); return; }
+  try {
+    host.innerHTML = txLabSlots.map((_,i)=>renderTxLabSlot(i)).join('');
+    updateTxLabProgress();
+  } catch (e) {
+    console.error('Transaction Lab render failed:', e);
+    host.innerHTML = `<div class="result-error" style="padding:14px">Render error: ${e.message}<br><pre style="font-size:.7rem">${e.stack||''}</pre></div>`;
+  }
+}
+
+function txField(idx, field, val) {
+  txLabSlots[idx][field] = val;
+  saveTxLabSlots();
+  // Lightweight status refresh without re-rendering whole slot
+  const el = document.getElementById(`txlab-slot-${idx}`);
+  if (el) {
+    const st = txStatusInfo[txSlotStatus(txLabSlots[idx])];
+    const badge = el.querySelector('div span:nth-child(3)');
+    if (badge) { badge.style.color = st.col; badge.textContent = `${st.icon} ${st.label}`; }
+  }
+  updateTxLabProgress();
+}
+
+function clearTxLabSlot(idx) {
+  if (!confirm(`Clear slot #${idx+1} (${TX_PROBLEMS[idx].name})?`)) return;
+  txLabSlots[idx] = blankTxSlot(idx);
+  saveTxLabSlots();
+  const el = document.getElementById(`txlab-slot-${idx}`);
+  if (el) el.outerHTML = renderTxLabSlot(idx);
+  updateTxLabProgress();
+}
+
+function copyTxSql(idx, field, btn) {
+  const sql = (txLabSlots[idx][field] || '').trim();
+  if (!sql) {
+    alert('That SQL field is empty.');
+    return;
+  }
+  navigator.clipboard.writeText(sql).then(() => {
+    const original = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = original; }, 1200);
+  }).catch(() => {
+    // Fallback: select+copy via temporary textarea
+    const ta = document.createElement('textarea');
+    ta.value = sql; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    const original = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = original; }, 1200);
+  });
+}
+
+document.querySelector('.tab[data-page="txlab"]').addEventListener('click', renderTxLabAll);
+renderTxLabAll();
 </script>
 </body>
 </html>"""

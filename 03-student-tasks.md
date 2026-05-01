@@ -3,7 +3,7 @@
 **Course**: Advanced Database
 **Submission**: Live demo on your running dashboard app.
 
-This is Part 1 - Indexes. Parts 2-4 (Concurrency, Deadlocks, Backup & Recovery) will come later and use the same dashboard. Ignore those tabs for now.
+This is Part 1 - Indexes. Part 2 (Concurrency) is in `06-concurrency-tasks.md`. Part 3 (Backup & Recovery) will come later.
 
 No Word documents, no screenshots, no written reports. You open the app in front of the instructor and walk through your indexes.
 
@@ -85,4 +85,4 @@ Open the Index Inspector tab.
 - Index Inspector shows 0 on slow and 10+ on fast.
 - Bonus slots filled in if you went further.
 
-That's Part 1. Parts 2-4 come later.
+That's Part 1. Part 2 (Concurrency) is in `06-concurrency-tasks.md`.

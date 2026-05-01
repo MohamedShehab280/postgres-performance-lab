@@ -60,14 +60,12 @@ A few seconds. `hospital_fast` now has the same rows as `hospital_slow`, no inde
 | Tab | What it shows |
 |---|---|
 | Overview | Row counts on both databases |
-| Index Lab | Where you create and justify your indexes |
+| Index Lab | Where you create and justify your indexes (Part 1) |
 | Performance Lab | Side-by-side timing and EXPLAIN plans |
 | Index Inspector | Custom indexes on each database |
-| Concurrency Lab | Double-booking simulation (Part 2) |
-| Deadlock Lab | Real deadlock with PostgreSQL's error (Part 3) |
-| Backup Lab | Runs pg_dump (Part 4) |
+| Transaction Lab | Where you save the 5 concurrency scenarios (Part 2) |
+| Backup Lab | Runs pg_dump (Part 3) |
 | SQL Sandbox | Type any query, see both databases |
-| Tx Visualizer | Step through BEGIN / EXECUTE / COMMIT / ROLLBACK |
 
 ---
 
