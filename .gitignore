@@ -29,3 +29,11 @@ hospital_*_backup.sql
 *-notes.md
 _*.md
 session_summary*.md
+
+# Local lab submissions
+backup_lab.txt
+index_lab.txt
+transaction_lab.txt
+dashboard/backup_lab.txt
+dashboard/index_lab.txt
+dashboard/transaction_lab.txt

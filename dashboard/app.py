@@ -19,6 +19,32 @@ import threading
 import subprocess
 import time
 import os
+import json
+
+_LAB_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKUP_LAB_FILE = os.path.join(_LAB_DIR, "backup_lab.txt")
+INDEX_LAB_FILE  = os.path.join(_LAB_DIR, "index_lab.txt")
+TXN_LAB_FILE    = os.path.join(_LAB_DIR, "transaction_lab.txt")
+
+
+def _lab_load(path):
+    if not os.path.exists(path):
+        return {"data": None}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        return {"data": json.loads(content) if content else None}
+    except Exception as e:
+        return {"data": None, "error": str(e)}
+
+
+def _lab_save(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 app = Flask(__name__)
 
@@ -192,6 +218,39 @@ def api_compare(qid):
         "speedup": speedup
     })
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  API: LAB FILE STORAGE — Index Lab, Transaction Lab, Backup Lab
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/backup-lab/load", methods=["GET"])
+def backup_lab_load():
+    return jsonify(_lab_load(BACKUP_LAB_FILE))
+
+
+@app.route("/api/backup-lab/save", methods=["POST"])
+def backup_lab_save():
+    return jsonify(_lab_save(BACKUP_LAB_FILE, request.get_json() or {}))
+
+
+@app.route("/api/index-lab/load", methods=["GET"])
+def index_lab_load():
+    return jsonify(_lab_load(INDEX_LAB_FILE))
+
+
+@app.route("/api/index-lab/save", methods=["POST"])
+def index_lab_save():
+    return jsonify(_lab_save(INDEX_LAB_FILE, request.get_json() or []))
+
+
+@app.route("/api/txn-lab/load", methods=["GET"])
+def txn_lab_load():
+    return jsonify(_lab_load(TXN_LAB_FILE))
+
+
+@app.route("/api/txn-lab/save", methods=["POST"])
+def txn_lab_save():
+    return jsonify(_lab_save(TXN_LAB_FILE, request.get_json() or []))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -874,42 +933,23 @@ DROP INDEX idx_appointments_doctor;"
 
 <!-- ══════════════════════════════════════════════════════ PAGE: BACKUP ══ -->
 <div id="page-backup" class="page">
-  <div class="sec">Backup Lab</div>
+  <div class="sec">💾 Backup Lab — Recovery Planning</div>
 
-  <div class="grid-2" style="margin-bottom:24px">
-    <div class="card">
-      <div class="card-title">💾 What this demonstrates</div>
-      <div class="card-sub">
-        Click the backup button to run a real <code>pg_dump</code> on the selected database.
-        The app calls the <code>pg_dump</code> binary, shows the terminal output in real time,
-        and displays the file size on disk.
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-title">📋 The backup gap proof</div>
-      <div class="card-sub" style="line-height:1.8">
-        1. Take backup → note the file size<br>
-        2. The backup captures data at <b>this exact moment</b><br>
-        3. Any INSERT/UPDATE after this → not in the backup<br>
-        4. Restoring brings you back to backup time
-      </div>
-    </div>
+  <div class="result-info" style="font-size:.78rem;margin-bottom:16px;line-height:1.9">
+    The 3 recovery tools, one line each:
+    <br>• <b><code>pg_dump</code> restore</b> — a snapshot of the database at the moment the dump ran.
+    <br>• <b><code>pg_basebackup</code> + WAL replay to the end</b> — a full physical copy plus every change recorded since.
+    <br>• <b>PITR</b> — same as above, but you stop the WAL replay at a chosen second.
+    <br><span style="color:var(--amber)">Pick the right one for each scenario. All 4 are required.</span>
   </div>
 
-  <div class="card-title" style="margin-bottom:12px">Choose database to back up:</div>
-  <div class="db-toggle">
-    <button class="db-toggle-btn active-slow" id="bk-slow-btn" onclick="setBkDb('slow')">🔴 hospital_slow</button>
-    <button class="db-toggle-btn" id="bk-fast-btn" onclick="setBkDb('fast')">🟢 hospital_fast</button>
+  <div class="card" style="margin-bottom:20px;padding:12px 18px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+    <span style="font-size:.75rem;font-weight:700">Auto-save</span>
+    <span id="bklab-status" style="font-size:.72rem;color:var(--muted)">Loading…</span>
+    <span style="font-size:.7rem;color:var(--muted);margin-left:auto">Saved to <code>dashboard/backup_lab.txt</code></span>
   </div>
 
-  <div class="btn-group">
-    <button class="btn btn-primary" id="btn-backup" onclick="runBackup()">💾 Run pg_dump</button>
-    <span id="bk-status" style="font-size:.75rem;color:var(--muted)"></span>
-  </div>
-
-  <div id="bk-result" style="display:none">
-    <div class="backup-status result-success" id="bk-output"></div>
-  </div>
+  <div id="bklab-slots"></div>
 </div>
 
 <!-- ══════════════════════════════════════════════════════ JS ══ -->
@@ -1173,39 +1213,123 @@ async function runCreateIndex() {
 
 
 // ── BACKUP LAB ──
-let bkDb = 'slow';
-function setBkDb(db) {
-  bkDb = db;
-  document.getElementById('bk-slow-btn').className = 'db-toggle-btn' + (db==='slow' ? ' active-slow' : '');
-  document.getElementById('bk-fast-btn').className = 'db-toggle-btn' + (db==='fast' ? ' active-fast' : '');
+const BKLAB_SCENARIOS = [
+  { id: 'A', title: 'Scenario A - The bad migration',
+    desc: "Wednesday 9 AM, a developer's migration script had a typo and ran DROP TABLE prescriptions on hospital_fast. Pharmacists noticed four hours later. The hospital takes one pg_dump per night at 2 AM. Nothing else.",
+    invented: false },
+  { id: 'B', title: 'Scenario B - The disk failure',
+    desc: "Sunday 4:47 PM, the database server's disk failed. PostgreSQL crashed. The hospital takes a weekly pg_basebackup and archives WAL files every minute to a separate disk. Around 17,000 transactions happened today. Bring the system back up with minimum data loss.",
+    invented: false },
+  { id: 'C', title: 'Scenario C - The accidental DELETE',
+    desc: "Friday 11:23 AM, an admin ran DELETE FROM appointments WHERE status = 'scheduled' thinking they were on test, but they were on production. 6,200 upcoming appointments are gone. Last pg_basebackup was 9 hours ago. WAL archiving is on.",
+    invented: false },
+  { id: 'D', title: 'Scenario D - Your own',
+    desc: 'Invent your own hospital disaster. Be specific about what broke, when, and what backup tools were in place before the incident. Do not reuse A, B, C, or another student.',
+    invented: true },
+];
+
+let bklabData = {};
+
+function blankBkSlot(invented) {
+  return invented ? {disaster:'', tool:'', plan:'', lost:''} : {tool:'', plan:'', lost:''};
 }
 
-async function runBackup() {
-  const btn = document.getElementById('btn-backup');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Running pg_dump…';
-  document.getElementById('bk-status').textContent = 'This may take 30–60 seconds…';
-  document.getElementById('bk-result').style.display = 'none';
-
-  const r = await fetch('/api/backup', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({db: bkDb})
-  }).then(r => r.json());
-
-  document.getElementById('bk-result').style.display = 'block';
-  const el = document.getElementById('bk-output');
-  if (r.success) {
-    el.className = 'backup-status result-success';
-    el.innerHTML = `✅ Backup complete!\n\nFile: ${r.file}\nSize: ${r.size_mb} MB\nTime: ${r.time_ms}ms\n\n${r.message}`;
-  } else {
-    el.className = 'backup-status result-error';
-    el.textContent = '❌ Backup failed:\n\n' + r.error;
+async function loadBkLab() {
+  const status = document.getElementById('bklab-status');
+  if (status) status.textContent = 'Loading…';
+  try {
+    const r = await fetch('/api/backup-lab/load').then(x => x.json());
+    bklabData = r.data || {};
+    BKLAB_SCENARIOS.forEach(s => {
+      if (!bklabData[s.id]) bklabData[s.id] = blankBkSlot(s.invented);
+    });
+    if (status) status.innerHTML = '<span style="color:var(--fast)">Loaded</span>';
+    renderBkLab();
+  } catch(e) {
+    if (status) status.innerHTML = '<span style="color:var(--slow)">Load failed: ' + e.message + '</span>';
   }
-
-  btn.disabled = false;
-  btn.innerHTML = '💾 Run pg_dump';
-  document.getElementById('bk-status').textContent = '';
 }
+
+let bklabSaveTimer = null;
+function bklabFieldChange(id, field, val) {
+  if (!bklabData[id]) bklabData[id] = blankBkSlot(BKLAB_SCENARIOS.find(s=>s.id===id).invented);
+  bklabData[id][field] = val;
+  const status = document.getElementById('bklab-status');
+  if (status) status.innerHTML = '<span style="color:var(--amber)">Saving…</span>';
+  if (bklabSaveTimer) clearTimeout(bklabSaveTimer);
+  bklabSaveTimer = setTimeout(saveBkLab, 600);
+}
+
+async function saveBkLab() {
+  const status = document.getElementById('bklab-status');
+  try {
+    const r = await fetch('/api/backup-lab/save', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(bklabData),
+    }).then(x => x.json());
+    if (r.ok) {
+      if (status) status.innerHTML = '<span style="color:var(--fast)">Saved ✓</span>';
+    } else {
+      if (status) status.innerHTML = '<span style="color:var(--slow)">Save failed: ' + (r.error||'') + '</span>';
+    }
+  } catch(e) {
+    if (status) status.innerHTML = '<span style="color:var(--slow)">' + e.message + '</span>';
+  }
+}
+
+function bklabTa(id, rows, val, ph, cb) {
+  return `<textarea id="${id}" rows="${rows}" oninput="${cb}"
+    style="width:100%;margin-top:5px;background:#030810;border:1px solid var(--border);
+           border-radius:var(--r-sm);padding:10px 12px;color:var(--text);font-family:inherit;
+           font-size:.78rem;line-height:1.6;resize:vertical;transition:border .2s"
+    placeholder="${escAttr(ph)}"
+    onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'"
+  >${escText(val)}</textarea>`;
+}
+
+function renderBkSlot(s) {
+  const d = bklabData[s.id] || blankBkSlot(s.invented);
+  const top = s.invented
+    ? `<div style="margin-bottom:12px">
+         <label style="font-size:.67rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">Your disaster - what broke, when, what backup tools were in place</label>
+         ${bklabTa(`bklab-${s.id}-disaster`, 3, d.disaster||'',
+           'Be specific. Do not reuse A, B, C, or another student.',
+           `bklabFieldChange('${s.id}','disaster',this.value)`)}
+       </div>`
+    : `<div style="font-size:.74rem;color:var(--muted);margin-bottom:14px;line-height:1.6">${escText(s.desc)}</div>`;
+
+  return `<div class="card" style="margin-bottom:18px">
+    <div style="font-size:.95rem;font-weight:800;margin-bottom:10px">${s.title}</div>
+    ${top}
+    <div style="margin-bottom:12px">
+      <label style="font-size:.67rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">1. Which tool fits and why</label>
+      ${bklabTa(`bklab-${s.id}-tool`, 2, d.tool||'',
+        'One or two sentences.',
+        `bklabFieldChange('${s.id}','tool',this.value)`)}
+    </div>
+    <div style="margin-bottom:12px">
+      <label style="font-size:.67rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">2. Recovery plan</label>
+      ${bklabTa(`bklab-${s.id}-plan`, 4, d.plan||'',
+        'Three to five short steps in order.',
+        `bklabFieldChange('${s.id}','plan',this.value)`)}
+    </div>
+    <div>
+      <label style="font-size:.67rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em">3. What is still lost + one policy change</label>
+      ${bklabTa(`bklab-${s.id}-lost`, 3, d.lost||'',
+        'Be honest about what cannot be recovered, then one policy change.',
+        `bklabFieldChange('${s.id}','lost',this.value)`)}
+    </div>
+  </div>`;
+}
+
+function renderBkLab() {
+  const host = document.getElementById('bklab-slots');
+  if (!host) return;
+  host.innerHTML = BKLAB_SCENARIOS.map(renderBkSlot).join('');
+}
+
+document.querySelector('.tab[data-page="backup"]').addEventListener('click', loadBkLab);
+loadBkLab();
 </script>
 
 <!-- ══════════════════════════════════════════════════════ PAGE: SQL SANDBOX ══ -->
@@ -1308,7 +1432,7 @@ async function runBackup() {
       </div>
       <div id="txlab-progress-text" style="font-size:.8rem;font-weight:800;color:var(--fast)">0 / 5</div>
     </div>
-    <div style="font-size:.68rem;color:var(--muted)">A slot counts as complete when all fields below are filled. Progress is saved in your browser.</div>
+    <div style="font-size:.68rem;color:var(--muted)">A slot counts as complete when all fields below are filled. Saved to <code>dashboard/transaction_lab.txt</code>.</div>
   </div>
 
   <!-- 5 fixed slots -->
@@ -1342,7 +1466,7 @@ async function runBackup() {
       <span>Regular: <b id="cnt-regular" style="color:#60a5fa">0</b> / 5</span>
       <span>Composite: <b id="cnt-composite" style="color:#c084fc">0</b> / 3</span>
       <span>Partial: <b id="cnt-partial" style="color:#34d399">0</b> / 2</span>
-      <span style="margin-left:auto;color:var(--muted);font-size:.68rem">Progress is saved in your browser automatically</span>
+      <span style="margin-left:auto;color:var(--muted);font-size:.68rem">Saved to <code>dashboard/index_lab.txt</code></span>
     </div>
   </div>
 
@@ -1462,27 +1586,53 @@ const LAB_SCENARIOS = [
   { id:'BC-15', dept:'Finance',    hint:'Billing by appointment + payment' },
 ];
 
-const LAB_KEY = 'indexLab_v2';
+const LAB_KEY = 'indexLab_v2';   // legacy localStorage key, used only for one-time migration
 const blankSlot = i => ({ id:i, scenario:'', justification:'', createSql:'',
   indexName:'', indexType:'', testQuery:'',
   status:'empty', scanType:'', queryMs:0, planSnippet:'', errorMsg:'', rowsReturned:0 });
 
-let labSlots = (() => {
+let labSlots = Array.from({length:15}, (_,i) => blankSlot(i));
+let labLoaded = false;
+let labSaveTimer = null;
+
+async function loadLabFromServer() {
+  try {
+    const r = await fetch('/api/index-lab/load').then(x => x.json());
+    if (r.data && Array.isArray(r.data) && r.data.length === 15) {
+      labSlots = r.data;
+      labLoaded = true;
+      return;
+    }
+  } catch(e) {}
+  // No server file yet — try to migrate from localStorage
   try {
     const d2 = JSON.parse(localStorage.getItem(LAB_KEY));
-    if (d2 && d2.length === 15) return d2;
-    // Migrate from v1 (10 slots) by padding 5 blank slots
+    if (d2 && d2.length === 15) {
+      labSlots = d2;
+      labLoaded = true;
+      saveLabSlots();   // push to server file
+      return;
+    }
     const d1 = JSON.parse(localStorage.getItem('indexLab_v1'));
     if (d1 && d1.length === 10) {
-      const migrated = [...d1, ...Array.from({length:5}, (_,i) => blankSlot(10+i))];
-      localStorage.setItem(LAB_KEY, JSON.stringify(migrated));
-      return migrated;
+      labSlots = [...d1, ...Array.from({length:5}, (_,i) => blankSlot(10+i))];
+      labLoaded = true;
+      saveLabSlots();
+      return;
     }
-  } catch(e){}
-  return Array.from({length:15}, (_,i) => blankSlot(i));
-})();
+  } catch(e) {}
+  labLoaded = true;
+}
 
-function saveLabSlots() { localStorage.setItem(LAB_KEY, JSON.stringify(labSlots)); }
+function saveLabSlots() {
+  if (labSaveTimer) clearTimeout(labSaveTimer);
+  labSaveTimer = setTimeout(() => {
+    fetch('/api/index-lab/save', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(labSlots),
+    }).catch(()=>{});
+  }, 500);
+}
 
 function extractIndexName(sql) {
   const m = sql.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)/i);
@@ -1684,7 +1834,11 @@ function clearLabSlot(idx){
   updateLabProgress();
 }
 
-document.querySelector('.tab[data-page="indexlab"]').addEventListener('click', renderLabAll);
+document.querySelector('.tab[data-page="indexlab"]').addEventListener('click', async () => {
+  if (!labLoaded) await loadLabFromServer();
+  renderLabAll();
+});
+loadLabFromServer();
 
 // ── TRANSACTION LAB ──
 const TX_PROBLEMS = [
@@ -1700,7 +1854,7 @@ const TX_PROBLEMS = [
     desc:'Two sessions each hold a lock the other one wants. PostgreSQL detects the cycle and kills one. Fix it with a consistent lock-acquisition order.' },
 ];
 
-const TXLAB_KEY = 'txnLab_v1';
+const TXLAB_KEY = 'txnLab_v1';   // legacy localStorage key, used only for one-time migration
 const blankTxSlot = i => ({
   id: i,
   scenario: '',
@@ -1713,15 +1867,40 @@ const blankTxSlot = i => ({
   whyFix: '',
 });
 
-let txLabSlots = (() => {
+let txLabSlots = TX_PROBLEMS.map((_,i) => blankTxSlot(i));
+let txLabLoaded = false;
+let txLabSaveTimer = null;
+
+async function loadTxLabFromServer() {
+  try {
+    const r = await fetch('/api/txn-lab/load').then(x => x.json());
+    if (r.data && Array.isArray(r.data) && r.data.length === TX_PROBLEMS.length) {
+      txLabSlots = r.data;
+      txLabLoaded = true;
+      return;
+    }
+  } catch(e) {}
   try {
     const d = JSON.parse(localStorage.getItem(TXLAB_KEY));
-    if (d && d.length === TX_PROBLEMS.length) return d;
-  } catch(e){}
-  return TX_PROBLEMS.map((_,i) => blankTxSlot(i));
-})();
+    if (d && d.length === TX_PROBLEMS.length) {
+      txLabSlots = d;
+      txLabLoaded = true;
+      saveTxLabSlots();
+      return;
+    }
+  } catch(e) {}
+  txLabLoaded = true;
+}
 
-function saveTxLabSlots() { localStorage.setItem(TXLAB_KEY, JSON.stringify(txLabSlots)); }
+function saveTxLabSlots() {
+  if (txLabSaveTimer) clearTimeout(txLabSaveTimer);
+  txLabSaveTimer = setTimeout(() => {
+    fetch('/api/txn-lab/save', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(txLabSlots),
+    }).catch(()=>{});
+  }, 500);
+}
 
 function txSlotComplete(s) {
   return ['scenario','sessionABuggy','sessionBBuggy','badOutcome',
@@ -1927,8 +2106,11 @@ function copyTxSql(idx, field, btn) {
   });
 }
 
-document.querySelector('.tab[data-page="txlab"]').addEventListener('click', renderTxLabAll);
-renderTxLabAll();
+document.querySelector('.tab[data-page="txlab"]').addEventListener('click', async () => {
+  if (!txLabLoaded) await loadTxLabFromServer();
+  renderTxLabAll();
+});
+(async () => { await loadTxLabFromServer(); renderTxLabAll(); })();
 </script>
 </body>
 </html>"""
